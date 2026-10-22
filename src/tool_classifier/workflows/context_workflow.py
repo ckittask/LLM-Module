@@ -1,11 +1,15 @@
 """Context workflow executor - Layer 2: Conversation history and greetings."""
 
+import asyncio
 from typing import Any, AsyncIterator, Dict, Optional, cast
 import time
 import dspy
-from loguru import logger
+from langfuse import observe
+from src.loki_logger import LokiLogger
 
+from src.models.conversation_history_models import ConversationHistoryState
 from src.models.request_models import OrchestrationRequest, OrchestrationResponse
+from src.utils.conversation_history_store import ConversationHistoryStore
 from tool_classifier.base_workflow import BaseWorkflow
 from tool_classifier.context_analyzer import ContextAnalyzer, ContextDetectionResult
 from tool_classifier.workflows.service_workflow import LLMServiceProtocol
@@ -13,10 +17,19 @@ from src.guardrails.nemo_rails_adapter import NeMoRailsAdapter
 from src.llm_orchestrator_config.llm_manager import LLMManager
 from src.utils.cost_utils import get_lm_usage_since
 from src.utils.language_detector import detect_language
-from src.llm_orchestrator_config.llm_ochestrator_constants import (
-    GUARDRAILS_BLOCKED_PHRASES,
-    OUTPUT_GUARDRAIL_VIOLATION_MESSAGE,
+from src.utils.observation_utils import (
+    safe_observation_context,
+    update_observation_safe,
 )
+from src.llm_orchestrator_config.llm_ochestrator_constants import (
+    is_output_guardrail_violation,
+    OUTPUT_GUARDRAIL_VIOLATION_MESSAGE,
+    OUTPUT_GUARDRAIL_VIOLATION_PARTIAL_MESSAGES,
+    get_localized_message,
+)
+
+# Initialize Loki logger
+logger = LokiLogger(service_name="context-workflow")
 
 
 class ContextWorkflowExecutor(BaseWorkflow):
@@ -46,6 +59,7 @@ class ContextWorkflowExecutor(BaseWorkflow):
         self,
         llm_manager: LLMManager,
         orchestration_service: Optional[LLMServiceProtocol] = None,
+        conversation_history_store: Optional[ConversationHistoryStore] = None,
     ) -> None:
         """
         Initialize context workflow executor.
@@ -53,15 +67,73 @@ class ContextWorkflowExecutor(BaseWorkflow):
         Args:
             llm_manager: LLM manager for context analysis
             orchestration_service: Reference to LLMOrchestrationService for cost logging
+            conversation_history_store: Redis-backed conversation history store;
+                when provided, history is read from Redis (canonical source) rather
+                than from ``request.conversationHistory``.
         """
         self.llm_manager = llm_manager
         self.orchestration_service = orchestration_service
+        self.conversation_history_store = conversation_history_store
         self.context_analyzer = ContextAnalyzer(llm_manager)
+        self._prompt_config_loader = (
+            getattr(orchestration_service, "prompt_config_loader", None)
+            if orchestration_service is not None
+            else None
+        )
         logger.info("Context workflow executor initialized")
 
-    @staticmethod
-    def _build_history(request: OrchestrationRequest) -> list[Dict[str, Any]]:
-        return [
+    async def _build_history(
+        self, request: OrchestrationRequest
+    ) -> tuple[list[Dict[str, Any]], Optional[str]]:
+        """Fetch conversation history, preferring Redis over request payload.
+
+        When a :class:`ConversationHistoryStore` is wired in and the session has
+        stored rounds, the Redis state is used as the canonical source of truth and
+        the GUI-provided ``request.conversationHistory`` is ignored.  Any running
+        summary stored alongside the rounds is returned as ``pre_computed_summary``
+        so that downstream callers can skip an expensive LLM summarisation step.
+
+        If the store is absent, raises, or returns no rounds the method falls back
+        to the conversation history supplied in the request.
+
+        Returns:
+            A ``(history_dicts, pre_computed_summary)`` tuple where
+            *history_dicts* is a list of ``{"authorRole", "message", "timestamp"}``
+            dicts and *pre_computed_summary* is the Redis summary string or ``None``.
+        """
+        if self.conversation_history_store is not None:
+            try:
+                state: ConversationHistoryState = (
+                    await self.conversation_history_store.get_context(request.chatId)
+                )
+                if state.rounds:
+                    history: list[Dict[str, Any]] = []
+                    for round_ in state.rounds:
+                        history.append(
+                            {
+                                "authorRole": "user",
+                                "message": round_.user_message,
+                                "timestamp": str(round_.timestamp),
+                            }
+                        )
+                        history.append(
+                            {
+                                "authorRole": "bot",
+                                "message": round_.bot_message,
+                                "timestamp": str(round_.timestamp),
+                            }
+                        )
+                    logger.debug(
+                        f"[{request.chatId}] Using Redis history: {len(state.rounds)} rounds, summary={'present' if state.summary else 'absent'}"
+                    )
+                    return history, state.summary
+            except Exception as exc:
+                logger.warning(
+                    f"[{request.chatId}] Redis history fetch failed, falling back to request history: {exc}"
+                )
+
+        # Fallback: use the conversation history supplied in the request
+        request_history: list[Dict[str, Any]] = [
             {
                 "authorRole": item.authorRole,
                 "message": item.message,
@@ -69,20 +141,50 @@ class ContextWorkflowExecutor(BaseWorkflow):
             }
             for item in request.conversationHistory
         ]
+        return request_history, None
 
+    async def _get_custom_instructions(self) -> str:
+        """Fetch custom prompt instructions from the loader, or return empty string.
+
+        Mirrors APIToolWorkflowExecutor._get_custom_instructions. The
+        PromptConfigurationLoader has a 5-minute TTL cache, so this is cheap.
+        Runs the synchronous requests call in a thread pool via asyncio.to_thread
+        so a cache miss or slow Ruuter response never blocks the event loop.
+        """
+        if self._prompt_config_loader is None:
+            return ""
+        try:
+            custom_prompt = await asyncio.to_thread(
+                self._prompt_config_loader.get_custom_instructions
+            )
+            return custom_prompt if custom_prompt else ""
+        except Exception as e:
+            logger.error(
+                f"ContextWorkflow: failed to fetch custom instructions: {e}",
+                exc_info=True,
+            )
+            return ""
+
+    @observe(name="context_workflow_detect", as_type="chain")
     async def _detect(
         self,
         message: str,
         history: list[Dict[str, Any]],
         time_metric: Dict[str, float],
         costs_metric: Dict[str, Dict[str, Any]],
+        pre_computed_summary: Optional[str] = None,
     ) -> Optional[ContextDetectionResult]:
         """Phase 1: run context detection with summary fallback.
 
         Checks the last 10 conversation turns first. If the query cannot be
-        answered from those and the history exceeds 10 turns, falls back to a
-        summary-based check over the older turns. Returns None on error so the
-        caller falls through to RAG.
+        answered from those and the history exceeds 10 turns (or a Redis summary
+        is available), falls back to a summary-based check. Returns None on error
+        so the caller falls through to RAG.
+
+        Args:
+            pre_computed_summary: Running conversation summary retrieved from Redis.
+                When provided, the expensive LLM summarisation step is skipped and
+                this value is used directly.
         """
         try:
             start = time.time()
@@ -90,13 +192,30 @@ class ContextWorkflowExecutor(BaseWorkflow):
                 result,
                 cost,
             ) = await self.context_analyzer.detect_context_with_summary_fallback(
-                query=message, conversation_history=history
+                query=message,
+                conversation_history=history,
+                pre_computed_summary=pre_computed_summary,
             )
             time_metric["context.detection"] = time.time() - start
             costs_metric["context_detection"] = cost
+
+            update_observation_safe(
+                input_data={"query": message, "history_length": len(history)},
+                output_data={
+                    "is_greeting": result.is_greeting if result else None,
+                    "can_answer_from_context": result.can_answer_from_context
+                    if result
+                    else None,
+                },
+                metadata={"usage_summary": cost},
+            )
             return result
         except Exception as e:
             logger.error(f"Phase 1 detection failed: {e}", exc_info=True)
+            update_observation_safe(
+                output_data={"error": str(e)},
+                metadata={"usage_summary": {}},
+            )
             return None
 
     def _log_costs(self, costs_metric: Dict[str, Dict[str, Any]]) -> None:
@@ -105,31 +224,48 @@ class ContextWorkflowExecutor(BaseWorkflow):
 
     @staticmethod
     def _is_guardrail_violation(chunk: str) -> bool:
-        """Return True if the chunk matches a known guardrail blocked phrase."""
-        chunk_lower = chunk.strip().lower()
-        return any(
-            phrase.lower() in chunk_lower
-            and len(chunk_lower) <= len(phrase.lower()) + 20
-            for phrase in GUARDRAILS_BLOCKED_PHRASES
-        )
+        """Return True if the chunk indicates an output guardrail block.
 
+        Covers both bot refusal phrases and NeMo's `enable_rails_exceptions`
+        JSON payload (guardrails_violation / "Blocked by self check output
+        rails") emitted as a content chunk mid-stream.
+        """
+        return is_output_guardrail_violation(chunk)
+
+    @observe(name="context_workflow_generate_response", as_type="chain")
     async def _generate_response_async(
         self,
         request: OrchestrationRequest,
         context_snippet: str,
         time_metric: Dict[str, float],
         costs_metric: Dict[str, Dict[str, Any]],
+        custom_instructions: str = "",
     ) -> Optional[OrchestrationResponse]:
         """Non-streaming: Generate response + apply output guardrails."""
         try:
             start = time.time()
             answer, cost = await self.context_analyzer.generate_context_response(
-                query=request.message, context_snippet=context_snippet
+                query=request.message,
+                context_snippet=context_snippet,
+                custom_instructions=custom_instructions,
             )
             time_metric["context.generation"] = time.time() - start
             costs_metric["context_response"] = cost
+            update_observation_safe(
+                input_data={
+                    "chat_id": request.chatId,
+                    "query": request.message,
+                    "context_snippet_length": len(context_snippet),
+                },
+                output_data={"has_answer": bool(answer)},
+                metadata={"usage": cost},
+            )
         except Exception as e:
             logger.error(f"Phase 2 generation failed: {e}", exc_info=True)
+            update_observation_safe(
+                output_data={"error": str(e)},
+                metadata={"usage": {}},
+            )
             self._log_costs(costs_metric)
             return None
 
@@ -174,41 +310,99 @@ class ContextWorkflowExecutor(BaseWorkflow):
         history_length_before: int,
         guardrails_adapter: NeMoRailsAdapter,
         costs_metric: Dict[str, Dict[str, Any]],
+        request: OrchestrationRequest,
+        custom_instructions: str = "",
     ) -> AsyncIterator[str]:
         """Async generator: stream history answer through NeMo Guardrails."""
         bot_generator = self.context_analyzer.stream_context_response(
-            query=query, context_snippet=context_snippet
+            query=query,
+            context_snippet=context_snippet,
+            custom_instructions=custom_instructions,
         )
         orchestration_service = self.orchestration_service
         if orchestration_service is None:
             return
-        async for validated_chunk in guardrails_adapter.stream_with_guardrails(
-            user_message=query, bot_message_generator=bot_generator
-        ):
-            if isinstance(validated_chunk, str) and self._is_guardrail_violation(
-                validated_chunk
+        accumulated_response: list[str] = []
+        with safe_observation_context(
+            as_type="generation",
+            name="context_workflow_streaming",
+            input={"query": query, "chat_id": chat_id},
+        ) as _generation:
+            async for validated_chunk in guardrails_adapter.stream_with_guardrails(
+                user_message=query, bot_message_generator=bot_generator
             ):
-                logger.warning(f"[{chat_id}] Guardrails violation in context streaming")
-                yield orchestration_service.format_sse(
-                    chat_id, OUTPUT_GUARDRAIL_VIOLATION_MESSAGE
-                )
-                yield orchestration_service.format_sse(chat_id, "END")
-                costs_metric["context_response"] = get_lm_usage_since(
-                    history_length_before
-                )
-                orchestration_service.log_costs(costs_metric)
-                return
-            yield orchestration_service.format_sse(chat_id, validated_chunk)
-        yield orchestration_service.format_sse(chat_id, "END")
-        logger.info(f"[{chat_id}] Context streaming complete")
-        costs_metric["context_response"] = get_lm_usage_since(history_length_before)
-        orchestration_service.log_costs(costs_metric)
+                if isinstance(validated_chunk, str) and self._is_guardrail_violation(
+                    validated_chunk
+                ):
+                    logger.warning(
+                        f"[{chat_id}] Guardrails violation in context streaming"
+                    )
+                    # If part of the answer already streamed, use the "rest of the
+                    # response" wording on a new line so it doesn't concatenate with
+                    # the partial answer; otherwise use the standard message.
+                    if accumulated_response:
+                        detected_language = getattr(request, "_detected_language", "en")
+                        violation_message = "\n\n" + get_localized_message(
+                            OUTPUT_GUARDRAIL_VIOLATION_PARTIAL_MESSAGES,
+                            detected_language,
+                        )
+                    else:
+                        violation_message = OUTPUT_GUARDRAIL_VIOLATION_MESSAGE
+                    yield orchestration_service.format_sse(chat_id, violation_message)
+                    await orchestration_service.store_streaming_inference(
+                        request, violation_message
+                    )
+                    yield orchestration_service.format_sse(chat_id, "END")
+                    costs_metric["context_response"] = get_lm_usage_since(
+                        history_length_before
+                    )
+                    _usage = costs_metric["context_response"]
+                    try:
+                        if _generation is not None:
+                            _generation.update(
+                                usage_details={
+                                    "input": _usage.get("total_prompt_tokens", 0),
+                                    "output": _usage.get("total_completion_tokens", 0),
+                                    "total": _usage.get("total_tokens", 0),
+                                },
+                                cost_details={"total": _usage.get("total_cost", 0.0)},
+                                output={"guardrail_violation": True},
+                            )
+                    except Exception as _e:
+                        logger.debug(
+                            f"Langfuse streaming observation update skipped: {_e}"
+                        )
+                    orchestration_service.log_costs(costs_metric)
+                    return
+                accumulated_response.append(validated_chunk)
+                yield orchestration_service.format_sse(chat_id, validated_chunk)
+            final_answer = "".join(accumulated_response)
+            await orchestration_service.store_streaming_inference(request, final_answer)
+            yield orchestration_service.format_sse(chat_id, "END")
+            logger.info(f"[{chat_id}] Context streaming complete")
+            costs_metric["context_response"] = get_lm_usage_since(history_length_before)
+            _usage = costs_metric["context_response"]
+            try:
+                if _generation is not None:
+                    _generation.update(
+                        usage_details={
+                            "input": _usage.get("total_prompt_tokens", 0),
+                            "output": _usage.get("total_completion_tokens", 0),
+                            "total": _usage.get("total_tokens", 0),
+                        },
+                        cost_details={"total": _usage.get("total_cost", 0.0)},
+                        output={"answer_preview": final_answer[:500]},
+                    )
+            except Exception as _e:
+                logger.debug(f"Langfuse streaming observation update skipped: {_e}")
+            orchestration_service.log_costs(costs_metric)
 
     async def _create_history_stream(
         self,
         request: OrchestrationRequest,
         context_snippet: str,
         costs_metric: Dict[str, Dict[str, Any]],
+        custom_instructions: str = "",
     ) -> Optional[AsyncIterator[str]]:
         """Set up guardrails adapter and return the history streaming generator."""
         if not self.orchestration_service:
@@ -251,8 +445,11 @@ class ContextWorkflowExecutor(BaseWorkflow):
             history_length_before=history_length_before,
             guardrails_adapter=guardrails_adapter,
             costs_metric=costs_metric,
+            request=request,
+            custom_instructions=custom_instructions,
         )
 
+    @observe(name="context_workflow_execute_async", as_type="span")
     async def execute_async(
         self,
         request: OrchestrationRequest,
@@ -276,8 +473,9 @@ class ContextWorkflowExecutor(BaseWorkflow):
         if time_metric is None:
             time_metric = {}
 
+        custom_instructions = await self._get_custom_instructions()
         language = detect_language(request.message)
-        history = self._build_history(request)
+        history, pre_computed_summary = await self._build_history(request)
 
         # Check if analysis is pre-computed (e.g. from classifier classify step)
         pre_computed = context.get("analysis_result")
@@ -295,9 +493,18 @@ class ContextWorkflowExecutor(BaseWorkflow):
             )
         else:
             _detected = await self._detect(
-                request.message, history, time_metric, costs_metric
+                request.message,
+                history,
+                time_metric,
+                costs_metric,
+                pre_computed_summary,
             )
             if _detected is None:
+                update_observation_safe(
+                    input_data={"chat_id": request.chatId, "query": request.message},
+                    output_data={"workflow_result": "fallback_to_rag"},
+                    metadata={"costs": costs_metric},
+                )
                 self._log_costs(costs_metric)
                 context["costs_dict"] = costs_metric
                 return None
@@ -316,6 +523,11 @@ class ContextWorkflowExecutor(BaseWorkflow):
             )
             self._log_costs(costs_metric)
             context["costs_dict"] = costs_metric
+            update_observation_safe(
+                input_data={"chat_id": request.chatId, "query": request.message},
+                output_data={"workflow_result": "greeting_response"},
+                metadata={"costs": costs_metric},
+            )
             return OrchestrationResponse(
                 chatId=request.chatId,
                 llmServiceActive=True,
@@ -329,17 +541,36 @@ class ContextWorkflowExecutor(BaseWorkflow):
             and detection_result.context_snippet
         ):
             context["costs_dict"] = costs_metric
+            update_observation_safe(
+                input_data={"chat_id": request.chatId, "query": request.message},
+                output_data={"workflow_result": "context_answer_generation"},
+                metadata={"costs": costs_metric},
+            )
             return await self._generate_response_async(
-                request, detection_result.context_snippet, time_metric, costs_metric
+                request,
+                detection_result.context_snippet,
+                time_metric,
+                costs_metric,
+                custom_instructions=custom_instructions,
             )
 
         logger.warning(
             f"[{request.chatId}] Cannot answer from context — falling back to RAG"
         )
+        update_observation_safe(
+            input_data={"chat_id": request.chatId, "query": request.message},
+            output_data={"workflow_result": "fallback_to_rag"},
+            metadata={"costs": costs_metric},
+        )
         self._log_costs(costs_metric)
         context["costs_dict"] = costs_metric
         return None
 
+    @observe(
+        name="context_workflow_execute_streaming",
+        as_type="span",
+        capture_output=False,
+    )
     async def execute_streaming(
         self,
         request: OrchestrationRequest,
@@ -363,13 +594,19 @@ class ContextWorkflowExecutor(BaseWorkflow):
         if time_metric is None:
             time_metric = {}
 
+        custom_instructions = await self._get_custom_instructions()
         language = detect_language(request.message)
-        history = self._build_history(request)
+        history, pre_computed_summary = await self._build_history(request)
 
         detection_result = await self._detect(
-            request.message, history, time_metric, costs_metric
+            request.message, history, time_metric, costs_metric, pre_computed_summary
         )
         if detection_result is None:
+            update_observation_safe(
+                input_data={"chat_id": request.chatId, "query": request.message},
+                output_data={"workflow_result": "fallback_to_rag"},
+                metadata={"costs": costs_metric},
+            )
             self._log_costs(costs_metric)
             return None
 
@@ -392,21 +629,40 @@ class ContextWorkflowExecutor(BaseWorkflow):
 
             async def _stream_greeting() -> AsyncIterator[str]:
                 yield orchestration_service.format_sse(chat_id, greeting)
+                await orchestration_service.store_streaming_inference(request, greeting)
                 yield orchestration_service.format_sse(chat_id, "END")
                 orchestration_service.log_costs(costs_metric)
 
+            update_observation_safe(
+                input_data={"chat_id": request.chatId, "query": request.message},
+                output_data={"workflow_result": "greeting_stream"},
+                metadata={"costs": costs_metric},
+            )
             return _stream_greeting()
 
         if (
             detection_result.can_answer_from_context
             and detection_result.context_snippet
         ):
+            update_observation_safe(
+                input_data={"chat_id": request.chatId, "query": request.message},
+                output_data={"workflow_result": "context_stream_generation"},
+                metadata={"costs": costs_metric},
+            )
             return await self._create_history_stream(
-                request, detection_result.context_snippet, costs_metric
+                request,
+                detection_result.context_snippet,
+                costs_metric,
+                custom_instructions=custom_instructions,
             )
 
         logger.warning(
             f"[{request.chatId}] Cannot answer from context — falling back to RAG"
+        )
+        update_observation_safe(
+            input_data={"chat_id": request.chatId, "query": request.message},
+            output_data={"workflow_result": "fallback_to_rag"},
+            metadata={"costs": costs_metric},
         )
         self._log_costs(costs_metric)
         return None

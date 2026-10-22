@@ -11,10 +11,11 @@ Achieves 49% improvement in retrieval accuracy.
 """
 
 from typing import List, Dict, Any, Optional, Union, TYPE_CHECKING
-from loguru import logger
+from src.loki_logger import LokiLogger
 import asyncio
 import time
 from langfuse import observe
+
 from contextual_retrieval.config import ConfigLoader, ContextualRetrievalConfig
 
 # Type checking import to avoid circular dependency at runtime
@@ -25,6 +26,9 @@ from contextual_retrieval.qdrant_search import QdrantContextualSearch
 
 from contextual_retrieval.bm25_search import SmartBM25Search
 from contextual_retrieval.rank_fusion import DynamicRankFusion
+
+# Initialize Loki logger
+logger = LokiLogger(service_name="contextual-retriever")
 
 
 class ContextualRetriever:
@@ -208,6 +212,11 @@ class ContextualRetriever:
             # Step 2: Execute multi-query searches in parallel for enhanced coverage
             semantic_results: List[Dict[str, Any]] = []
             bm25_results: List[Dict[str, Any]] = []
+            # Distinguishes "semantic ran and found nothing" (a real relevance verdict)
+            # from "semantic errored" (infrastructure problem). Both yield an empty
+            # list, but only the former should suppress BM25-only results - see the
+            # corroboration gate below.
+            semantic_search_failed = False
 
             if self.config.enable_parallel_search:
                 semantic_task = self._semantic_search(
@@ -231,6 +240,7 @@ class ContextualRetriever:
                 if isinstance(semantic_result, BaseException):
                     logger.error(f"Semantic search failed: {semantic_result}")
                     semantic_results = []
+                    semantic_search_failed = True
                 else:
                     semantic_results = semantic_result
 
@@ -258,6 +268,36 @@ class ContextualRetriever:
             fused_results = self.rank_fusion.fuse_results(
                 semantic_results, bm25_results, final_top_n
             )
+
+            # Step 4b: Semantic corroboration gate.
+            #
+            # BM25 has no relevance floor - it returns top-N by keyword score however
+            # weak the match. A contentless query ("explain it?") still produces dozens
+            # of lexical hits on common words. Semantic search DOES have a floor
+            # (score_threshold), so "semantic found nothing" is the system's own verdict
+            # that the knowledge base holds no conceptual match for this query.
+            #
+            # Returning [] here makes the EXISTING zero-chunk out-of-scope gates fire,
+            # in both _stream_rag_pipeline and _execute_orchestration_pipeline.
+            if (
+                self.config.search.require_semantic_corroboration
+                and not semantic_results
+                and bm25_results
+            ):
+                if semantic_search_failed:
+                    logger.warning(
+                        f"Semantic search FAILED; falling back to {len(bm25_results)} "
+                        f"BM25-only results (degraded relevance). "
+                        f"Investigate the embedding service."
+                    )
+                else:
+                    logger.info(
+                        f"Semantic search returned no results above threshold "
+                        f"({self.config.search.score_threshold:.2f}) while BM25 returned "
+                        f"{len(bm25_results)} lexical matches. Treating retrieval as "
+                        f"empty - BM25-only matches are not relevance."
+                    )
+                    return []
 
             # Step 5: Convert to expected format for compatibility
             formatted_results = self._format_results_for_compatibility(fused_results)

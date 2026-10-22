@@ -2,7 +2,7 @@
 
 import uuid
 from typing import Optional, List
-from loguru import logger
+from src.loki_logger import LokiLogger
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     Distance,
@@ -20,6 +20,9 @@ from qdrant_client.models import (
 from intent_data_enrichment.constants import EnrichmentConstants
 from intent_data_enrichment.models import EnrichedService
 
+# Initialize Loki logger
+logger = LokiLogger(service_name="intent-qdrant-manager")
+
 # Error messages
 _CLIENT_NOT_INITIALIZED = "Qdrant client not initialized"
 
@@ -29,22 +32,19 @@ class QdrantManager:
 
     def __init__(
         self,
-        host: str = EnrichmentConstants.DEFAULT_QDRANT_HOST,
-        port: int = EnrichmentConstants.DEFAULT_QDRANT_PORT,
+        url: str = EnrichmentConstants.DEFAULT_QDRANT_URL,
         collection_name: str = EnrichmentConstants.COLLECTION_NAME,
     ) -> None:
-        self.host = host
-        self.port = port
+        self.url = url
         self.collection_name = collection_name
         self.client: Optional[QdrantClient] = None
 
     def connect(self) -> None:
         """Connect to Qdrant."""
         try:
-            logger.info(f"Connecting to Qdrant at {self.host}:{self.port}")
+            logger.info(f"Connecting to Qdrant at {self.url}")
             self.client = QdrantClient(
-                host=self.host,
-                port=self.port,
+                url=self.url,
                 timeout=30,
                 prefer_grpc=False,
                 api_key=None,

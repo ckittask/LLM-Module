@@ -67,7 +67,9 @@ services:
     volumes:
       - ./DSL/CronManager/DSL:/DSL
       - ./DSL/CronManager/script:/app/scripts
+      - ./constants.ini:/app/config/constants.ini:ro  # service endpoint URLs (NOT /app/constants.ini - that one is baked into the image)
       - ./src/vector_indexer:/app/src/vector_indexer
+      - ./src/constants_loader.py:/app/src/constants_loader.py:ro  # reads /app/config/constants.ini
       - ./datasets:/app/datasets
       - ./grafana-configs/loki_logger.py:/app/src/vector_indexer/loki_logger.py
       - ./test-vault/agent-out:/agent/out:ro
@@ -147,6 +149,9 @@ services:
     volumes:
       - ./test-vault/agents/llm:/agent/in
       - ./test-vault/agent-out:/agent/out
+      # agent.hcl writes the token/pidfile/dummy to /agent/llm-token; map it to the
+      # same host dir as /agent/out so the host and other services see the token.
+      - ./test-vault/agent-out:/agent/llm-token
     entrypoint: ["sh", "-c"]
     command:
       - |
@@ -345,14 +350,16 @@ services:
     environment:
       # Infrastructure connections
       - VAULT_ADDR=http://vault:8200
-      - VAULT_TOKEN_FILE=/agent/out/token
+      # VaultAgentClient reads the token from /agent/llm-token/token by default
+      # (src/llm_orchestrator_config/vault/vault_client.py); mount must match.
+      - VAULT_TOKEN_FILE=/agent/llm-token/token
       - QDRANT_URL=http://qdrant:6333
       - EVAL_MODE=true
       # Disable OpenTelemetry tracing in test environment
       - OTEL_SDK_DISABLED=true
     volumes:
       - ./src/llm_config_module/config:/app/src/llm_config_module/config:ro
-      - ./test-vault/agent-out:/agent/out:ro
+      - ./test-vault/agent-out:/agent/llm-token:ro
       - test_llm_orchestration_logs:/app/logs
     depends_on:
       - qdrant

@@ -37,12 +37,16 @@ echo "[PACKAGES] Installing required packages..."
 "$UV_BIN" pip install --python "$VENV_PATH/bin/python3" "httpx>=0.27.0" || exit 1
 "$UV_BIN" pip install --python "$VENV_PATH/bin/python3" "pydantic>=2.11.7" || exit 1
 "$UV_BIN" pip install --python "$VENV_PATH/bin/python3" "qdrant-client>=1.15.1" || exit 1
-"$UV_BIN" pip install --python "$VENV_PATH/bin/python3" "loguru>=0.7.3" || exit 1
+"$UV_BIN" pip install --python "$VENV_PATH/bin/python3" "requests>=2.32.5" || exit 1
 
 echo "[PACKAGES] All packages installed successfully"
 
 # Set Python path
 export PYTHONPATH="/app:/app/src:/app/src/intent_data_enrichment:$PYTHONPATH"
+
+# Service endpoint URLs; also exports RAG_SEARCH_CONSTANTS so the Python
+# process below resolves the same constants.ini.
+source /app/scripts/load_constants.sh
 
 # Verify Python script exists
 [ ! -f "$PYTHON_SCRIPT" ] && { echo "[ERROR] Python script not found at $PYTHON_SCRIPT"; exit 1; }

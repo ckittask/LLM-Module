@@ -7,7 +7,10 @@ from typing import Optional, Dict, Any
 import time
 import threading
 from enum import Enum
-from loguru import logger
+from src.loki_logger import LokiLogger
+
+# Initialize Loki logger
+logger = LokiLogger(service_name="prompt-config-loader")
 
 
 class PromptConfigLoadError(Exception):
@@ -136,8 +139,8 @@ class PromptConfigurationLoader:
         # Step 3: Update cache and notify waiters (lock re-acquired)
         with self._cache_condition:
             try:
-                if prompt_text:
-                    # Success - update cache
+                if prompt_text is not None:
+                    # Success - update cache (prompt_text may be an empty string)
                     self._cached_prompt = prompt_text
                     self._cache_timestamp = time.time()
                     self._last_error = None

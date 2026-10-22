@@ -135,6 +135,10 @@ def _make_orchestration_service(session_store: Optional[AsyncMock] = None) -> Ma
         return f'data: {{"chatId":"{chat_id}","payload":{{"content":"{content}"}}}}\n\n'
 
     svc.format_sse = _format_sse
+    svc.store_streaming_inference = AsyncMock()
+    svc.handle_output_guardrails = AsyncMock(
+        side_effect=lambda _adapter, response, _req, _costs: response
+    )
     return svc
 
 
@@ -494,19 +498,25 @@ class TestStreamApiAndFormat:
             for token in ["Holiday", " info", " here."]:
                 yield token
 
-        executor._formatter.stream_forward = _fake_stream
+        mock_formatter = MagicMock()
+        mock_formatter.stream_forward = _fake_stream
 
-        frames = [
-            frame
-            async for frame in executor._stream_api_and_format(
-                chat_id=_CHAT_ID,
-                endpoint=_ENDPOINT_HOLIDAYS,
-                collected_params={"countryIsoCode": "EE"},
-                user_query="holidays",
-                detected_language="en",
-                orchestration_service=svc,
-            )
-        ]
+        with patch(
+            "tool_classifier.workflows.api_tool_workflow.APIResponseFormatterModule",
+            return_value=mock_formatter,
+        ):
+            frames = [
+                frame
+                async for frame in executor._stream_api_and_format(
+                    chat_id=_CHAT_ID,
+                    endpoint=_ENDPOINT_HOLIDAYS,
+                    collected_params={"countryIsoCode": "EE"},
+                    user_query="holidays",
+                    detected_language="en",
+                    orchestration_service=svc,
+                    request=_make_request(),
+                )
+            ]
 
         # 3 token frames + 1 END frame
         assert len(frames) == 4
@@ -536,6 +546,7 @@ class TestStreamApiAndFormat:
                 user_query="holidays",
                 detected_language="et",
                 orchestration_service=svc,
+                request=_make_request(),
             )
         ]
 
@@ -613,3 +624,131 @@ class TestExecuteAsync:
 
         assert result is expected_response
         executor._execute_api_and_format.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# EVAL_MODE: structured tool_calls on the response
+# ---------------------------------------------------------------------------
+
+
+class TestEvalModeToolCalls:
+    """``OrchestrationResponse.tool_calls`` is populated only under EVAL_MODE=true.
+
+    The deepeval API-tool tests read this field to score the resolved call
+    (name + parameters) instead of parsing the natural-language answer.
+    """
+
+    @pytest.mark.asyncio
+    async def test_tool_calls_absent_when_eval_mode_off(self, monkeypatch) -> None:
+        monkeypatch.delenv("EVAL_MODE", raising=False)
+        executor = _make_executor()
+        executor._api_caller.call = AsyncMock(
+            return_value=APICallResult(
+                success=True, status_code=200, response_data={"ok": 1}, error=None
+            )
+        )
+
+        with patch(
+            "tool_classifier.workflows.api_tool_workflow.asyncio.to_thread",
+            new_callable=AsyncMock,
+            return_value="All good",
+        ):
+            response = await executor._execute_api_and_format(
+                chat_id=_CHAT_ID,
+                endpoint=_ENDPOINT_HOLIDAYS,
+                collected_params={"countryIsoCode": "EE"},
+                user_query="holidays",
+                detected_language="en",
+            )
+
+        assert response.tool_calls is None
+        # Field must not leak into the production JSON payload
+        assert "tool_calls" not in response.model_dump(exclude_none=True)
+
+    @pytest.mark.asyncio
+    async def test_tool_calls_present_on_success(self, monkeypatch) -> None:
+        monkeypatch.setenv("EVAL_MODE", "true")
+        executor = _make_executor()
+        executor._api_caller.call = AsyncMock(
+            return_value=APICallResult(
+                success=True, status_code=200, response_data={"ok": 1}, error=None
+            )
+        )
+        params = {"countryIsoCode": "EE", "validFrom": "2026-04-01"}
+
+        with patch(
+            "tool_classifier.workflows.api_tool_workflow.asyncio.to_thread",
+            new_callable=AsyncMock,
+            return_value="Estonia has holidays.",
+        ):
+            response = await executor._execute_api_and_format(
+                chat_id=_CHAT_ID,
+                endpoint=_ENDPOINT_HOLIDAYS,
+                collected_params=params,
+                user_query="holidays",
+                detected_language="en",
+            )
+
+        assert response.tool_calls == [
+            {
+                "name": "get_public_holidays",
+                "method": "GET",
+                "url": "https://openholidaysapi.org/PublicHolidays",
+                "input_parameters": params,
+                "success": True,
+                "status_code": 200,
+                "cache_source": None,
+            }
+        ]
+        # The record is a copy, not the live params dict
+        assert response.tool_calls[0]["input_parameters"] is not params
+
+    @pytest.mark.asyncio
+    async def test_tool_calls_present_on_api_failure(self, monkeypatch) -> None:
+        """A failed upstream call still records the resolved tool + params."""
+        monkeypatch.setenv("EVAL_MODE", "true")
+        executor = _make_executor()
+        executor._api_caller.call = AsyncMock(
+            return_value=APICallResult(
+                success=False, status_code=503, response_data="", error="Unavailable"
+            )
+        )
+
+        response = await executor._execute_api_and_format(
+            chat_id=_CHAT_ID,
+            endpoint=_ENDPOINT_HOLIDAYS,
+            collected_params={"countryIsoCode": "EE"},
+            user_query="holidays",
+            detected_language="en",
+        )
+
+        assert response.content == "Unavailable"
+        assert response.tool_calls is not None
+        assert response.tool_calls[0]["name"] == "get_public_holidays"
+        assert response.tool_calls[0]["success"] is False
+        assert response.tool_calls[0]["status_code"] == 503
+
+    @pytest.mark.asyncio
+    async def test_cached_response_records_cache_source(self, monkeypatch) -> None:
+        monkeypatch.setenv("EVAL_MODE", "true")
+        executor = _make_executor()
+
+        with patch(
+            "tool_classifier.workflows.api_tool_workflow.asyncio.to_thread",
+            new_callable=AsyncMock,
+            return_value="From cache",
+        ):
+            response = await executor._format_cached_response(
+                chat_id=_CHAT_ID,
+                endpoint=_ENDPOINT_HOLIDAYS,
+                user_query="holidays",
+                detected_language="en",
+                cached_raw_response={"ok": 1},
+                collected_params={"countryIsoCode": "EE"},
+                cache_source="L2",
+            )
+
+        assert response.tool_calls is not None
+        assert response.tool_calls[0]["cache_source"] == "L2"
+        assert response.tool_calls[0]["success"] is True
+        assert response.tool_calls[0]["status_code"] is None

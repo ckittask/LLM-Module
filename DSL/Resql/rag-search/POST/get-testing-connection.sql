@@ -1,5 +1,6 @@
 SELECT 
     id,
+    vault_uuid,
     connection_name,
     used_budget,
     monthly_budget,
@@ -21,5 +22,6 @@ SELECT
     END AS budget_status
 FROM rag_search.llm_connections
 WHERE environment = 'testing'
+    AND connection_status = 'active'
 ORDER BY created_at DESC
 LIMIT 1;

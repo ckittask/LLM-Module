@@ -9,13 +9,17 @@ from pydantic import BaseModel, Field
 from typing import List
 import yaml
 from pathlib import Path
-from loguru import logger
+from src.loki_logger import LokiLogger
+
 from contextual_retrieval.constants import (
     HttpClientConstants,
     SearchConstants,
     CollectionConstants,
     BM25Constants,
 )
+
+# Initialize Loki logger
+logger = LokiLogger(service_name="contextual-retrieval-config")
 
 
 class HttpClientConfig(BaseModel):
@@ -124,6 +128,13 @@ class SearchConfig(BaseModel):
     score_threshold: float = Field(
         default=SearchConstants.DEFAULT_SCORE_THRESHOLD,
         description="Minimum score threshold",
+    )
+    require_semantic_corroboration: bool = Field(
+        default=SearchConstants.DEFAULT_REQUIRE_SEMANTIC_CORROBORATION,
+        description=(
+            "Treat retrieval as empty when semantic search returns nothing above "
+            "score_threshold but BM25 returns matches"
+        ),
     )
 
 
@@ -269,6 +280,10 @@ class ConfigLoader:
                 ),
                 score_threshold=search_config_data.get(
                     "score_threshold", SearchConstants.DEFAULT_SCORE_THRESHOLD
+                ),
+                require_semantic_corroboration=search_config_data.get(
+                    "require_semantic_corroboration",
+                    SearchConstants.DEFAULT_REQUIRE_SEMANTIC_CORROBORATION,
                 ),
             )
 

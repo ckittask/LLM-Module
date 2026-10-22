@@ -5,12 +5,16 @@ from typing import Any, AsyncIterator, Dict, List, Optional, Protocol, Union
 
 import dspy
 import httpx
-from loguru import logger
+from langfuse import observe
+from src.loki_logger import LokiLogger
 
 from llm_orchestrator_config.llm_manager import LLMManager
 from src.guardrails.nemo_rails_adapter import NeMoRailsAdapter
 
+from src.utils.conversation_history_helpers import get_conversation_history
+from src.utils.conversation_history_store import ConversationHistoryStore
 from src.utils.cost_utils import get_lm_usage_since
+from src.utils.observation_utils import update_observation_safe
 
 from models.request_models import (
     ChoiceButton,
@@ -19,13 +23,14 @@ from models.request_models import (
     TestOrchestrationResponse,
 )
 from tool_classifier.base_workflow import BaseWorkflow
+from llm_orchestrator_config.llm_ochestrator_constants import (
+    QDRANT_URL,
+    RAG_SEARCH_RUUTER_PUBLIC,
+)
 from tool_classifier.constants import (
     MAX_SERVICES_FOR_LLM_CONTEXT,
     QDRANT_COLLECTION,
-    QDRANT_HOST,
-    QDRANT_PORT,
     QDRANT_TIMEOUT,
-    RAG_SEARCH_RUUTER_PUBLIC,
     RUUTER_COMMON_SERVICE_BASE_URL,
     RUUTER_SERVICE_BASE_URL,
     SEMANTIC_SEARCH_THRESHOLD,
@@ -37,6 +42,11 @@ from tool_classifier.constants import (
 )
 from tool_classifier.intent_detector import IntentDetectionModule
 import time
+
+# Initialize Loki logger
+logger = LokiLogger(service_name="service-workflow")
+
+SERVICE_INTENT_DETECTION_METRIC = "service.intent_detection"
 
 
 class LLMServiceProtocol(Protocol):
@@ -104,6 +114,14 @@ class LLMServiceProtocol(Protocol):
         """Apply output guardrails to the generated response."""
         ...
 
+    async def store_streaming_inference(
+        self,
+        request: OrchestrationRequest,
+        final_answer: str,
+    ) -> None:
+        """Store streaming inference data for production/testing environments."""
+        ...
+
 
 class ServiceWorkflowExecutor(BaseWorkflow):
     """Executes external service calls via Ruuter endpoints (Layer 1)."""
@@ -116,6 +134,12 @@ class ServiceWorkflowExecutor(BaseWorkflow):
         """Initialize service workflow executor."""
         self.llm_manager = llm_manager
         self.orchestration_service = orchestration_service
+
+    def _get_conversation_history_store(self) -> Optional[ConversationHistoryStore]:
+        """Return the conversation history store from the orchestration service, or None."""
+        if self.orchestration_service is None:
+            return None
+        return getattr(self.orchestration_service, "conversation_history_store", None)
 
     async def _semantic_search_services(
         self,
@@ -150,9 +174,8 @@ class ServiceWorkflowExecutor(BaseWorkflow):
 
             query_embedding = embeddings[0]
 
-            qdrant_url = f"http://{QDRANT_HOST}:{QDRANT_PORT}"
             async with httpx.AsyncClient(
-                base_url=qdrant_url, timeout=QDRANT_TIMEOUT
+                base_url=QDRANT_URL, timeout=QDRANT_TIMEOUT
             ) as client:
                 try:
                     collection_info = await client.get(
@@ -243,14 +266,26 @@ class ServiceWorkflowExecutor(BaseWorkflow):
             logger.error(f"[{chat_id}] Service discovery failed: {e}", exc_info=True)
             return None
 
+    @observe(name="service_intent_detection_orchestration", as_type="chain")
     async def _detect_service_intent(
         self,
         user_query: str,
         services: List[Dict[str, Any]],
         conversation_history: List[Any],
         chat_id: str,
+        conversation_summary: Optional[str] = None,
     ) -> tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         """Use DSPy + LLMManager to detect service intent and extract entities.
+
+        Args:
+            user_query: The user's query string.
+            services: List of available service dicts.
+            conversation_history: Recent conversation turns (``ConversationItem`` objects).
+            chat_id: Chat identifier for logging.
+            conversation_summary: Optional summary of earlier conversation rounds
+                evicted from Redis.  When provided it is prepended to the history
+                passed to the intent detector so the LLM has additional context
+                without a separate summarisation call.
 
         Returns:
             Tuple of (intent_result, usage_info):
@@ -270,11 +305,21 @@ class ServiceWorkflowExecutor(BaseWorkflow):
             )
 
             intent_module = IntentDetectionModule()
-            history_dicts = [
-                {"authorRole": msg.authorRole, "message": msg.message}
-                for msg in conversation_history
-                if hasattr(msg, "authorRole") and hasattr(msg, "message")
-            ]
+            history_dicts: List[Dict[str, str]] = []
+            if conversation_summary:
+                history_dicts.append(
+                    {
+                        "authorRole": "system",
+                        "message": f"Summary of earlier conversation: {conversation_summary}",
+                    }
+                )
+            history_dicts.extend(
+                [
+                    {"authorRole": msg.authorRole, "message": msg.message}
+                    for msg in conversation_history
+                    if hasattr(msg, "authorRole") and hasattr(msg, "message")
+                ]
+            )
 
             with self.llm_manager.use_task_local():
                 intent_result = intent_module.forward(
@@ -284,11 +329,45 @@ class ServiceWorkflowExecutor(BaseWorkflow):
                 )
 
             usage_info = get_lm_usage_since(history_length_before)
+            # NOTE: this is a "chain" span wrapping the child "generation" span
+            # (service_intent_detection_llm), which already attaches this same
+            # usage/cost. Do NOT pass usage under the "usage" key here — that
+            # would make update_observation_safe() call update_current_generation()
+            # a second time with the identical cost, double-counting it in
+            # Langfuse (chain costs auto-aggregate from children already).
+            # Reported here as "usage_summary" for visibility only.
+            update_observation_safe(
+                input_data={
+                    "chat_id": chat_id,
+                    "query": user_query,
+                    "services_count": len(services),
+                },
+                output_data={
+                    "matched_service_id": (
+                        intent_result.get("matched_service_id")
+                        if intent_result
+                        else None
+                    ),
+                    "confidence": intent_result.get("confidence", 0.0)
+                    if intent_result
+                    else 0.0,
+                },
+                metadata={"usage_summary": usage_info},
+            )
 
             return intent_result, usage_info
 
         except Exception as e:
             logger.error(f"[{chat_id}] Intent detection failed: {e}", exc_info=True)
+            update_observation_safe(
+                input_data={
+                    "chat_id": chat_id,
+                    "query": user_query,
+                    "services_count": len(services),
+                },
+                output_data={"matched_service_id": None, "error": str(e)},
+                metadata={"usage_summary": {}},
+            )
             return None, {}
 
     def _validate_detected_service(
@@ -331,11 +410,17 @@ class ServiceWorkflowExecutor(BaseWorkflow):
             context: Context dict to populate with results
             costs_metric: Dictionary to track LLM costs
         """
+        conversation_history, conversation_summary = await get_conversation_history(
+            chat_id=request.chatId,
+            store=self._get_conversation_history_store(),
+            fallback=request.conversationHistory,
+        )
         intent_result, intent_usage = await self._detect_service_intent(
             user_query=request.message,
             services=services,
-            conversation_history=request.conversationHistory,
+            conversation_history=conversation_history,
             chat_id=chat_id,
+            conversation_summary=conversation_summary,
         )
         costs_metric["intent_detection"] = intent_usage
 
@@ -698,6 +783,7 @@ class ServiceWorkflowExecutor(BaseWorkflow):
         else:
             logger.warning(f"[{chat_id}] Service discovery failed")
 
+    @observe(name="service_workflow_execute_async", as_type="span")
     async def execute_async(
         self,
         request: OrchestrationRequest,
@@ -746,7 +832,7 @@ class ServiceWorkflowExecutor(BaseWorkflow):
                     context=context,
                     costs_metric=costs_metric,
                 )
-                time_metric["service.intent_detection"] = time.time() - start_time
+                time_metric[SERVICE_INTENT_DETECTION_METRIC] = time.time() - start_time
 
                 if not context.get("service_data"):
                     context["service_id"] = matched.get("service_id")
@@ -768,7 +854,7 @@ class ServiceWorkflowExecutor(BaseWorkflow):
                     context=context,
                     costs_metric=costs_metric,
                 )
-            time_metric["service.intent_detection"] = time.time() - start_time
+            time_metric[SERVICE_INTENT_DETECTION_METRIC] = time.time() - start_time
 
         else:
             start_time = time.time()
@@ -779,11 +865,21 @@ class ServiceWorkflowExecutor(BaseWorkflow):
 
         if not context.get("service_id"):
             logger.info(f"[{chat_id}] No service matched, falling back")
+            update_observation_safe(
+                input_data={"chat_id": chat_id, "query": request.message},
+                output_data={"workflow_result": "fallback_to_rag"},
+                metadata={"costs": costs_metric},
+            )
             return None
 
         start_time = time.time()
         service_metadata = self._extract_service_metadata(context, chat_id)
         if not service_metadata:
+            update_observation_safe(
+                input_data={"chat_id": chat_id, "query": request.message},
+                output_data={"workflow_result": "missing_service_metadata"},
+                metadata={"costs": costs_metric},
+            )
             return None
 
         logger.info(
@@ -835,7 +931,21 @@ class ServiceWorkflowExecutor(BaseWorkflow):
 
         if service_result is None:
             logger.warning(f"[{chat_id}] Service endpoint call failed, falling back")
+            update_observation_safe(
+                input_data={"chat_id": chat_id, "query": request.message},
+                output_data={"workflow_result": "fallback_to_rag"},
+                metadata={"costs": costs_metric},
+            )
             return None
+
+        update_observation_safe(
+            input_data={"chat_id": chat_id, "query": request.message},
+            output_data={
+                "workflow_result": "service_response",
+                "service_id": context.get("service_id"),
+            },
+            metadata={"costs": costs_metric},
+        )
 
         service_content = service_result["content"]
         service_buttons = service_result["buttons"]
@@ -854,6 +964,11 @@ class ServiceWorkflowExecutor(BaseWorkflow):
             buttons=buttons_list if buttons_list else None,
         )
 
+    @observe(
+        name="service_workflow_execute_streaming",
+        as_type="span",
+        capture_output=False,
+    )
     async def execute_streaming(
         self,
         request: OrchestrationRequest,
@@ -899,7 +1014,7 @@ class ServiceWorkflowExecutor(BaseWorkflow):
                     context=context,
                     costs_metric=costs_metric,
                 )
-                time_metric["service.intent_detection"] = time.time() - start_time
+                time_metric[SERVICE_INTENT_DETECTION_METRIC] = time.time() - start_time
 
                 if not context.get("service_data"):
                     context["service_id"] = matched.get("service_id")
@@ -921,7 +1036,7 @@ class ServiceWorkflowExecutor(BaseWorkflow):
                     context=context,
                     costs_metric=costs_metric,
                 )
-            time_metric["service.intent_detection"] = time.time() - start_time
+            time_metric[SERVICE_INTENT_DETECTION_METRIC] = time.time() - start_time
 
         else:
             start_time = time.time()
@@ -932,10 +1047,20 @@ class ServiceWorkflowExecutor(BaseWorkflow):
 
         if not context.get("service_id"):
             logger.info(f"[{chat_id}] No service matched, falling back")
+            update_observation_safe(
+                input_data={"chat_id": chat_id, "query": request.message},
+                output_data={"workflow_result": "fallback_to_rag"},
+                metadata={"costs": costs_metric},
+            )
             return None
 
         service_metadata = self._extract_service_metadata(context, chat_id)
         if not service_metadata:
+            update_observation_safe(
+                input_data={"chat_id": chat_id, "query": request.message},
+                output_data={"workflow_result": "missing_service_metadata"},
+                metadata={"costs": costs_metric},
+            )
             return None
 
         logger.info(
@@ -981,6 +1106,11 @@ class ServiceWorkflowExecutor(BaseWorkflow):
 
         if service_result is None:
             logger.warning(f"[{chat_id}] Service endpoint call failed, falling back")
+            update_observation_safe(
+                input_data={"chat_id": chat_id, "query": request.message},
+                output_data={"workflow_result": "fallback_to_rag"},
+                metadata={"costs": costs_metric},
+            )
             return None
 
         if self.orchestration_service is None:
@@ -994,9 +1124,20 @@ class ServiceWorkflowExecutor(BaseWorkflow):
             yield orchestration_service.format_sse(
                 chat_id, service_content, service_buttons or None
             )
+            await orchestration_service.store_streaming_inference(
+                request, service_content
+            )
             yield orchestration_service.format_sse(chat_id, "END")
             orchestration_service.log_costs(costs_metric)
 
+        update_observation_safe(
+            input_data={"chat_id": chat_id, "query": request.message},
+            output_data={
+                "workflow_result": "service_stream",
+                "service_id": context.get("service_id"),
+            },
+            metadata={"costs": costs_metric},
+        )
         return service_stream()
 
     async def execute_direct_step(
@@ -1121,6 +1262,9 @@ class ServiceWorkflowExecutor(BaseWorkflow):
         async def step_stream() -> AsyncIterator[str]:
             yield orchestration_service.format_sse(
                 chat_id, service_content, service_buttons or None
+            )
+            await orchestration_service.store_streaming_inference(
+                request, service_content
             )
             yield orchestration_service.format_sse(chat_id, "END")
 
